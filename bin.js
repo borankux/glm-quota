@@ -1,236 +1,227 @@
 #!/usr/bin/env node
 
 /**
- * GLM Coding Plan Quota Checker
- * Uses ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL to query quota limits
- * and displays beautified progress bars.
+ * glm-quota — unified coding-plan quota CLI.
+ *
+ * v1 checked the GLM Coding Plan only; v2 turned it into one zero-dependency
+ * CLI over every coding agent this machine runs:
+ *
+ *   glm   — GLM Coding Plan (Zhipu / Z.ai), also covers Claude Code while
+ *           ANTHROPIC_BASE_URL routes through GLM
+ *   codex — OpenAI Codex CLI (ChatGPT Plus/Pro)
+ *   kimi  — Kimi Code CLI (Moonshot Kimi for Coding)
+ *
+ * Output modes:
+ *   glm-quota                      pretty console (all providers)
+ *   glm-quota --json               normalized JSON (scripts)
+ *   glm-quota --desk-status glm    codex_desk_status.v1-shaped JSON for the
+ *                                  ESP32 BLE bridge (esp-stuff tools)
+ *   glm-quota --provider glm,codex subset
+ *
+ * NOTE: window semantics differ per plan (Codex Pro is currently a single
+ * 7-day window; Kimi hides its monthly total). Renderers never assume a
+ * window exists — they label whatever the provider reports.
  */
 
-import https from 'https';
-import { readFileSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
+import { paintc, bar, countdown, fmtCount, setColor } from './lib/util.js';
+import { collectGlm, GLM_PROVIDER } from './lib/glm.js';
+import { collectCodex, CODEX_PROVIDER } from './lib/codex.js';
+import { collectKimi, KIMI_PROVIDER } from './lib/kimi.js';
 
-// Read from Claude Code settings.json, fall back to env vars
-function loadConfig() {
-  const settingsPath = join(homedir(), '.claude', 'settings.json');
-  try {
-    const raw = readFileSync(settingsPath, 'utf8');
-    const settings = JSON.parse(raw);
-    const env = settings.env || {};
-    return {
-      authToken: process.env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_AUTH_TOKEN || '',
-      baseUrl: process.env.ANTHROPIC_BASE_URL || env.ANTHROPIC_BASE_URL || '',
-    };
-  } catch {
-    return {
-      authToken: process.env.ANTHROPIC_AUTH_TOKEN || '',
-      baseUrl: process.env.ANTHROPIC_BASE_URL || '',
-    };
-  }
-}
-
-const { baseUrl, authToken } = loadConfig();
-
-if (!authToken) {
-  console.error('\n  \x1b[31mError:\x1b[0m No API token found');
-  console.error('  Set ANTHROPIC_AUTH_TOKEN env or configure in ~/.claude/settings.json\n');
-  process.exit(1);
-}
-if (!baseUrl) {
-  console.error('\n  \x1b[31mError:\x1b[0m No base URL found');
-  console.error('  Set ANTHROPIC_BASE_URL env or configure in ~/.claude/settings.json\n');
-  process.exit(1);
-}
-
-const parsedBaseUrl = new URL(baseUrl);
-const baseDomain = `${parsedBaseUrl.protocol}//${parsedBaseUrl.host}`;
-
-// ── Color helpers ──
-const c = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  magenta: '\x1b[35m',
-  cyan: '\x1b[36m',
-  bg: (r, g, b) => `\x1b[48;2;${r};${g};${b}m`,
-  fg: (r, g, b) => `\x1b[38;2;${r};${g};${b}m`,
+const PROVIDERS = {
+  [GLM_PROVIDER]: { collect: collectGlm, name: 'GLM Coding Plan', icon: '👑' },
+  [CODEX_PROVIDER]: { collect: collectCodex, name: 'Codex', icon: '🤖' },
+  [KIMI_PROVIDER]: { collect: collectKimi, name: 'Kimi Code', icon: '🦁' },
 };
 
-// ── Progress bar renderer ──
-function bar(percentage, width = 30) {
-  const filled = Math.round((percentage / 100) * width);
-  const empty = width - filled;
+// ── args ──
 
-  let color;
-  if (percentage >= 90) color = { r: 239, g: 68, b: 68 };      // red
-  else if (percentage >= 70) color = { r: 245, g: 158, b: 11 }; // amber
-  else if (percentage >= 40) color = { r: 234, g: 179, b: 8 };  // yellow
-  else color = { r: 34, g: 197, b: 94 };                        // green
-
-  const filledBar = c.bg(color.r, color.g, color.b) + ' '.repeat(filled) + c.reset;
-  const emptyBar = c.dim + c.bg(40, 40, 40) + ' '.repeat(empty) + c.reset;
-  const pctColor = percentage >= 90 ? c.red : percentage >= 70 ? c.yellow : c.green;
-
-  return `${filledBar}${emptyBar} ${pctColor}${String(percentage).padStart(3)}%${c.reset}`;
-}
-
-// ── Fetch quota limit ──
-function fetchQuota() {
-  return new Promise((resolve, reject) => {
-    const url = new URL(`${baseDomain}/api/monitor/usage/quota/limit`);
-    const options = {
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname,
-      method: 'GET',
-      headers: {
-        'Authorization': authToken,
-        'Accept-Language': 'en-US,en',
-        'Content-Type': 'application/json',
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-        }
-        try {
-          const json = JSON.parse(data);
-          resolve(json.data || json);
-        } catch (e) {
-          reject(new Error(`Parse error: ${e.message}`));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-// ── Fetch model usage (last 5h summary) ──
-function fetchModelUsage() {
-  return new Promise((resolve, reject) => {
-    const now = new Date();
-    const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, now.getHours(), 0, 0, 0);
-    const endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), 59, 59, 999);
-
-    const fmt = (d) => {
-      const pad = (n) => String(n).padStart(2, '0');
-      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    };
-
-    const qs = `?startTime=${encodeURIComponent(fmt(startDate))}&endTime=${encodeURIComponent(fmt(endDate))}`;
-    const url = new URL(`${baseDomain}/api/monitor/usage/model-usage`);
-
-    const options = {
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname + qs,
-      method: 'GET',
-      headers: {
-        'Authorization': authToken,
-        'Accept-Language': 'en-US,en',
-        'Content-Type': 'application/json',
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-        try { resolve(JSON.parse(data).data || JSON.parse(data)); }
-        catch { resolve(null); }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-// ── Format tokens ──
-function fmtTokens(n) {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
-  return String(n);
-}
-
-// ── Main ──
-async function main() {
-  const platform = baseUrl.includes('api.z.ai') ? 'Z.ai' : 'Zhipu (智谱)';
-
-  // Header
-  console.log('');
-  console.log(`  ${c.cyan}${c.bold}GLM Coding Plan${c.reset}  ${c.dim}·${c.reset}  ${c.dim}${platform}${c.reset}`);
-  console.log(`  ${c.dim}${'─'.repeat(48)}${c.reset}`);
-
-  let quotaData, usageData;
-  try {
-    [quotaData, usageData] = await Promise.all([fetchQuota(), fetchModelUsage()]);
-  } catch (e) {
-    console.error(`\n  ${c.red}Request failed:${c.reset} ${e.message}\n`);
-    process.exit(1);
-  }
-
-  if (!quotaData || !quotaData.limits) {
-    console.error(`\n  ${c.red}No quota data returned${c.reset}\n`);
-    process.exit(1);
-  }
-
-  const level = quotaData.level || 'unknown';
-  const levelIcon = level === 'max' ? '👑' : level === 'pro' ? '⭐' : '📦';
-  const levelName = level === 'max' ? 'Max' : level === 'pro' ? 'Pro' : level;
-  console.log(`  ${levelIcon}  Plan: ${c.bold}${levelName}${c.reset}`);
-
-  // 5h token limit
-  const tokensLimit = quotaData.limits.find(l => l.type === 'TOKENS_LIMIT' || l.type === 'Token usage(5 Hour)');
-  if (tokensLimit) {
-    const pct = tokensLimit.percentage ?? 0;
-    console.log('');
-    console.log(`  ${c.bold}⏱  Token Usage (5h rolling window)${c.reset}`);
-    console.log(`  ${bar(pct, 40)}`);
-    if (usageData?.totalUsage) {
-      const total = usageData.totalUsage.totalTokensUsage;
-      console.log(`  ${c.dim}   ${fmtTokens(total)} tokens used across ${usageData.totalUsage.totalModelCallCount} calls${c.reset}`);
-    }
-  }
-
-  // Monthly MCP limit
-  const timeLimit = quotaData.limits.find(l => l.type === 'TIME_LIMIT' || l.type === 'MCP usage(1 Month)');
-  if (timeLimit) {
-    const pct = timeLimit.percentage ?? 0;
-    const current = timeLimit.currentUsage ?? timeLimit.currentValue ?? 0;
-    const total = timeLimit.totol ?? timeLimit.usage ?? 0;
-
-    console.log('');
-    console.log(`  ${c.bold}🔧  MCP Usage (monthly)${c.reset}`);
-    console.log(`  ${bar(pct, 40)}`);
-    console.log(`  ${c.dim}   ${current} / ${total} calls used${c.reset}`);
-
-    if (timeLimit.usageDetails?.length) {
-      console.log(`  ${c.dim}   ├─${c.reset}`);
-      for (const detail of timeLimit.usageDetails) {
-        const name = detail.modelCode || detail.code;
-        const usage = detail.usage || detail.count || 0;
-        const detailPct = total > 0 ? Math.round((usage / total) * 100) : 0;
-        console.log(`  ${c.dim}   ${c.dim}├${c.reset} ${c.cyan}${name.padEnd(16)}${c.reset} ${usage.toString().padStart(5)} calls ${c.dim}(${detailPct}%)${c.reset}`);
+function parseArgs(argv) {
+  const args = { json: false, deskStatus: null, providers: null, noColor: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--json') args.json = true;
+    else if (a === '--desk-status') {
+      const next = argv[i + 1];
+      if (next && !next.startsWith('--')) {
+        args.deskStatus = next;
+        i++;
+      } else {
+        args.deskStatus = '*';
       }
+    } else if (a === '--provider' || a === '-p') {
+      args.providers = (argv[++i] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    } else if (a === '--no-color') args.noColor = true;
+    else if (a === '--help' || a === '-h') args.help = true;
+  }
+  return args;
+}
+
+function usage() {
+  console.log(`glm-quota — unified coding-plan quota CLI (GLM / Codex / Kimi)
+
+Usage:
+  glm-quota [options]
+
+Options:
+  --provider <list>   comma-separated subset: glm,codex,kimi (default: all)
+  --json              normalized JSON to stdout (for scripts)
+  --desk-status <p>   codex_desk_status.v1-shaped JSON for one provider,
+                      consumed by the ESP32 BLE bridge (esp-stuff)
+  --no-color          strip ANSI colors
+  -h, --help          this help
+`);
+}
+
+async function collectAll(names) {
+  const entries = await Promise.all(
+    names.map(async (name) => {
+      const p = PROVIDERS[name];
+      try {
+        return [name, await p.collect()];
+      } catch (e) {
+        return [name, { provider: name, ok: false, error: e.message }];
+      }
+    }),
+  );
+  return Object.fromEntries(entries);
+}
+
+// ── codex_desk_status.v1 slot builder ──
+// Field semantics follow the existing collector: `used_percent` carries the
+// REMAINING percentage (it drives the on-screen bar fill), `raw_used_percent`
+// carries actual used. Slots are fixed: primary=5h, secondary=week.
+
+function unavailableSlot(label, minutes) {
+  return { label, used_percent: -1, remaining_percent: -1, raw_used_percent: null, window_minutes: minutes, resets_at: null };
+}
+
+function slotFor(w, label, minutes) {
+  if (!w) return unavailableSlot(label, minutes);
+  return {
+    label,
+    used_percent: w.remaining_pct ?? -1,
+    remaining_percent: w.remaining_pct ?? -1,
+    raw_used_percent: w.used_pct,
+    window_minutes: minutes,
+    resets_at: w.resets_at,
+  };
+}
+
+function deskStatusFor(result) {
+  if (!result.ok) {
+    return {
+      schema: 'codex_desk_status.v1',
+      provider: result.provider,
+      plan_type: null,
+      limit_id: result.provider,
+      primary: unavailableSlot('5h', 300),
+      secondary: unavailableSlot('week', 10080),
+      status: { rate_limit_reached_type: null, collector_state: 'error', quota_timestamp: new Date().toISOString() },
+      error: result.error,
+    };
+  }
+  const five = result.windows.find((w) => w.kind === '5h');
+  const week = result.windows.find((w) => w.kind === 'week');
+  return {
+    schema: 'codex_desk_status.v1',
+    provider: result.provider,
+    plan_type: String(result.plan || '').toLowerCase() || null,
+    limit_id: result.provider,
+    primary: slotFor(five, '5h', 300),
+    secondary: slotFor(week, 'week', 10080),
+    status: { rate_limit_reached_type: null, collector_state: 'ok', quota_timestamp: new Date().toISOString() },
+  };
+}
+
+// ── pretty renderer ──
+
+function renderProvider(result, meta) {
+  const lines = [];
+  if (!result.ok) {
+    lines.push(`  ${paintc.red('✖')} ${paintc.bold(meta.name)}  ${paintc.dim(result.error || 'failed')}`);
+    return lines;
+  }
+
+  const platform = result.platform ? paintc.dim(` · ${result.platform}`) : '';
+  lines.push(`  ${meta.icon}  ${paintc.cyan(paintc.bold(meta.name))}${platform}  ${paintc.bold(String(result.plan))}`);
+
+  for (const w of result.windows) {
+    if (w.used_pct == null) {
+      lines.push(`     ${paintc.dim(`${w.label.padEnd(5)} ─ unknown`)}`);
+      continue;
+    }
+    const reset = w.resets_at ? countdown(w.resets_at) : 'unknown';
+    const parts = [];
+    if (w.total != null && w.used != null) {
+      parts.push(`${paintc.dim(`${fmtCount(w.used)} / ${fmtCount(w.total)}`)}`);
+    }
+    lines.push(`     ${w.label.padEnd(5)} ${bar(w.used_pct)}  ${paintc.dim(`resets ${reset}`)}`);
+    if (parts.length) lines.push(`           ${parts.join(' ')}`);
+  }
+
+  const extraBits = [];
+  const extra = result.extra || {};
+  if (extra.tokens_24h != null) extraBits.push(`24h ${fmtCount(extra.tokens_24h)} tokens · ${fmtCount(extra.calls_24h)} calls`);
+  if (extra.parallel_limit != null) extraBits.push(`parallel ${extra.parallel_used}/${extra.parallel_limit}`);
+  if (extra.credits_balance != null && extra.has_credits) extraBits.push(`credits ${extra.credits_balance}`);
+  if (extra.models?.length) extraBits.push(paintc.dim(`models: ${extra.models.join(', ')}`));
+  if (extraBits.length) lines.push(`     ${paintc.dim('·')} ${extraBits.join(`  ${paintc.dim('·')} `)}`);
+  return lines;
+}
+
+function renderPretty(results) {
+  const names = Object.keys(results);
+  const okCount = names.filter((n) => results[n].ok).length;
+  console.log('');
+  console.log(
+    `  ${paintc.bold('Coding Plan Quotas')}  ${paintc.dim(`· ${okCount}/${names.length} providers`)}  ${paintc.dim(`· ${new Date().toLocaleString()}`)}`,
+  );
+  console.log(`  ${paintc.dim('─'.repeat(56))}`);
+  for (const name of names) {
+    for (const line of renderProvider(results[name], PROVIDERS[name])) console.log(line);
+    console.log('');
+  }
+}
+
+// ── main ──
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    usage();
+    return 0;
+  }
+  setColor(!args.noColor && process.stdout.isTTY);
+
+  const names = args.providers?.length ? args.providers : Object.keys(PROVIDERS);
+  for (const n of names) {
+    if (!PROVIDERS[n]) {
+      console.error(`unknown provider: ${n} (known: ${Object.keys(PROVIDERS).join(', ')})`);
+      return 2;
     }
   }
 
-  console.log('');
-  console.log(`  ${c.dim}${'─'.repeat(48)}${c.reset}`);
-  const now = new Date();
-  console.log(`  ${c.dim}Updated ${now.toLocaleString()}${c.reset}`);
-  console.log('');
+  const results = await collectAll(names);
+
+  if (args.deskStatus) {
+    const wanted = args.deskStatus === '*' ? names : [args.deskStatus];
+    if (args.deskStatus !== '*' && !PROVIDERS[args.deskStatus]) {
+      console.error(`unknown provider for --desk-status: ${args.deskStatus}`);
+      return 2;
+    }
+    const out = wanted.length === 1 ? deskStatusFor(results[wanted[0]]) : wanted.map((n) => deskStatusFor(results[n]));
+    console.log(JSON.stringify(out, null, args.noColor ? 0 : 2));
+    return out.error ? 1 : 0;
+  }
+
+  if (args.json) {
+    console.log(JSON.stringify({ generated_at: Math.floor(Date.now() / 1000), providers: results }, null, 2));
+  } else {
+    renderPretty(results);
+  }
+
+  return names.every((n) => results[n].ok) ? 0 : names.some((n) => results[n].ok) ? 0 : 1;
 }
 
-main();
+process.exit(await main());

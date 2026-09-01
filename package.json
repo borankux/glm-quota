@@ -1,19 +1,25 @@
 {
   "name": "glm-quota",
-  "version": "1.0.0",
-  "description": "CLI to check GLM Coding Plan quota with beautified progress bars",
+  "version": "2.0.0",
+  "description": "Unified coding-plan quota CLI (GLM / OpenAI Codex / Kimi Code) with pretty bars, JSON and ESP32 desk-status output",
   "type": "module",
   "bin": {
     "glm-quota": "bin.js"
   },
   "files": [
-    "bin.js"
+    "bin.js",
+    "lib/"
   ],
   "keywords": [
     "glm",
     "zhipu",
+    "z-ai",
+    "codex",
+    "kimi",
+    "claude-code",
     "coding-plan",
     "quota",
+    "usage",
     "cli"
   ],
   "author": "Frank <borankux>",
