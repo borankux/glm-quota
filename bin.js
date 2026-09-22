@@ -90,21 +90,28 @@ async function collectAll(names) {
 // ── codex_desk_status.v1 slot builder ──
 // Field semantics follow the existing collector: `used_percent` carries the
 // REMAINING percentage (it drives the on-screen bar fill), `raw_used_percent`
-// carries actual used. Slots are fixed: primary=5h, secondary=week.
+// carries actual used. `windows` is the full ordered list (firmware v3.2+
+// renders up to 3); primary/secondary are kept for older consumers.
+// primary=5h, secondary=week or the monthly gate when no week exists (Kimi).
+
+const KIND_MINUTES = { '5h': 300, week: 10080, month: 43200, month_total: 43200 };
+const kindMinutes = (kind) => KIND_MINUTES[kind] ?? 43200;
 
 function unavailableSlot(label, minutes) {
-  return { label, used_percent: -1, remaining_percent: -1, raw_used_percent: null, window_minutes: minutes, resets_at: null };
+  return { label, used_percent: -1, remaining_percent: -1, raw_used_percent: null, window_minutes: minutes, resets_at: null, total: null, used: null };
 }
 
 function slotFor(w, label, minutes) {
   if (!w) return unavailableSlot(label, minutes);
   return {
-    label,
+    label: w.label ?? label,
     used_percent: w.remaining_pct ?? -1,
     remaining_percent: w.remaining_pct ?? -1,
     raw_used_percent: w.used_pct,
     window_minutes: minutes,
     resets_at: w.resets_at,
+    total: w.total ?? null,
+    used: w.used ?? null,
   };
 }
 
@@ -117,19 +124,24 @@ function deskStatusFor(result) {
       limit_id: result.provider,
       primary: unavailableSlot('5h', 300),
       secondary: unavailableSlot('week', 10080),
+      windows: [],
       status: { rate_limit_reached_type: null, collector_state: 'error', quota_timestamp: new Date().toISOString() },
       error: result.error,
     };
   }
-  const five = result.windows.find((w) => w.kind === '5h');
-  const week = result.windows.find((w) => w.kind === 'week');
+  const all = result.windows || [];
+  const slots = all.map((w) => slotFor(w, w.label, kindMinutes(w.kind)));
+  const five = all.find((w) => w.kind === '5h');
+  // monthly gates act as the secondary window when the provider has no week
+  const second = all.find((w) => w.kind === 'week') || all.find((w) => w.kind === 'month_total') || all.find((w) => w.kind === 'month');
   return {
     schema: 'codex_desk_status.v1',
     provider: result.provider,
     plan_type: String(result.plan || '').toLowerCase() || null,
     limit_id: result.provider,
     primary: slotFor(five, '5h', 300),
-    secondary: slotFor(week, 'week', 10080),
+    secondary: slotFor(second, 'week', kindMinutes(second?.kind || 'week')),
+    windows: slots,
     status: { rate_limit_reached_type: null, collector_state: 'ok', quota_timestamp: new Date().toISOString() },
   };
 }
